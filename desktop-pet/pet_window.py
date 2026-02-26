@@ -1,0 +1,780 @@
+import os
+import threading
+import tkinter as tk
+from tkinter import Menu
+from enum import Enum, auto
+import time
+import random
+import queue
+
+import pystray
+from pystray import MenuItem as TrayItem, Menu as TrayMenu
+from PIL import Image
+
+from pet import Pet
+from gif_animator import GifAnimator
+
+from win32api import GetMonitorInfo, MonitorFromPoint
+
+try:
+    from bite_overlay import BiteOverlay  # type: ignore
+except Exception:
+    BiteOverlay = None
+
+from engine2.windows_platforms import WindowsPlatforms
+
+from engine3.weather import WeatherService, WeatherState
+from engine3.reactions import WeatherReactor
+
+
+class ToolTip:
+    def __init__(self, widget, text, delayms=350):
+        self.widget = widget
+        self.text = text
+        self.delayms = delayms
+        self.afterid = None
+        self.tw = None
+        widget.bind("<Enter>", self.onenter, add="+")
+        widget.bind("<Leave>", self.onleave, add="+")
+        widget.bind("<ButtonPress>", self.onleave, add="+")
+
+    def onenter(self, event=None):
+        self.cancel()
+        self.afterid = self.widget.after(self.delayms, self.show)
+
+    def onleave(self, event=None):
+        self.cancel()
+        self.hide()
+
+    def cancel(self):
+        if self.afterid:
+            try:
+                self.widget.after_cancel(self.afterid)
+            except Exception:
+                pass
+        self.afterid = None
+
+    def show(self):
+        if self.tw:
+            return
+        x = self.widget.winfo_rootx() + 10
+        y = self.widget.winfo_rooty() + self.widget.winfo_height() + 8
+        self.tw = tk.Toplevel(self.widget)
+        self.tw.overrideredirect(True)
+        self.tw.attributes("-topmost", True)
+        self.tw.configure(bg="#0f0f0f")
+        self.tw.geometry(f"+{x}+{y}")
+        label = tk.Label(
+            self.tw,
+            text=self.text,
+            bg="#0f0f0f",
+            fg="white",
+            relief="solid",
+            borderwidth=1,
+            font=("Segoe UI", 9),
+        )
+        label.pack(ipadx=6, ipady=3)
+
+    def hide(self):
+        if self.tw:
+            try:
+                self.tw.destroy()
+            except Exception:
+                pass
+        self.tw = None
+
+
+class ActionsPopup(tk.Toplevel):
+    def __init__(self, masterwindow, callbacks):
+        super().__init__(masterwindow)
+        self.callbacks = callbacks
+        self.overrideredirect(True)
+        self.attributes("-topmost", True)
+        self.configure(bg="#000000")
+        self.dragdx = 0
+        self.dragdy = 0
+
+        outer = tk.Frame(self, bg="#000000", padx=8, pady=8)
+        outer.pack()
+
+        dragbar = tk.Frame(outer, bg="#141414", height=10, cursor="fleur")
+        dragbar.pack(fill="x", pady=(0, 8))
+        dragbar.bind("<Button-1>", self.startdrag, add="+")
+        dragbar.bind("<B1-Motion>", self.dodrag, add="+")
+
+        btnframe = tk.Frame(outer, bg="#000000")
+        btnframe.pack()
+
+        def mkbtn(txt, cmd, tip):
+            b = tk.Button(
+                btnframe,
+                text=txt,
+                width=2,
+                bd=1,
+                relief="solid",
+                highlightthickness=0,
+                bg="#161616",
+                fg="white",
+                activebackground="#2b2b2b",
+                activeforeground="white",
+                command=cmd,
+            )
+            b.pack(side="left", padx=3)
+            ToolTip(b, tip)
+            return b
+
+        mkbtn("🍖", self.callbacks["feed"], "Покормить")
+        mkbtn("🎮", self.callbacks["play"], "Поиграть")
+        mkbtn("💤", self.callbacks["sleep"], "Спать")
+        mkbtn("🦷", self.callbacks["togglebite"], "Режим укусов (если есть модуль)")
+        mkbtn("🧼", self.callbacks["resetbites"], "Сбросить укусы")
+        mkbtn("✖", self.callbacks["quit"], "Выход")
+
+    def startdrag(self, event):
+        self.dragdx = event.x_root - self.winfo_x()
+        self.dragdy = event.y_root - self.winfo_y()
+
+    def dodrag(self, event):
+        x = event.x_root - self.dragdx
+        y = event.y_root - self.dragdy
+        self.geometry(f"+{x}+{y}")
+
+
+class MoveState(Enum):
+    WALK = auto()
+    FALL = auto()
+    DRAG = auto()
+    PAUSE = auto()
+
+
+class HUDFollower(tk.Toplevel):
+    def __init__(self, master, pet):
+        super().__init__(master)
+        self.pet = pet
+
+        self.overrideredirect(True)
+        self.attributes("-topmost", True)
+        self.configure(bg="white")
+        self.attributes("-transparentcolor", "white")
+
+        self.bar_width = 260
+        self.bar_height = 18
+
+        self.frame = tk.Frame(self, bg="white")
+        self.frame.pack()
+
+        self.hunger = tk.Canvas(
+            self.frame,
+            width=self.bar_width,
+            height=self.bar_height,
+            bg="white",
+            highlightthickness=0,
+        )
+        self.hunger.pack(pady=3)
+
+        self.energy = tk.Canvas(
+            self.frame,
+            width=self.bar_width,
+            height=self.bar_height,
+            bg="white",
+            highlightthickness=0,
+        )
+        self.energy.pack(pady=3)
+
+        self.mood = tk.Canvas(
+            self.frame,
+            width=self.bar_width,
+            height=self.bar_height,
+            bg="white",
+            highlightthickness=0,
+        )
+        self.mood.pack(pady=3)
+
+        self.update_bars()
+
+    def _draw_badge_sticker(self, canvas, sticker):
+        h = self.bar_height
+        badge_r = h // 2
+        badge_cx = 14
+        badge_cy = h // 2
+        canvas.create_oval(
+            badge_cx - badge_r,
+            badge_cy - badge_r,
+            badge_cx + badge_r,
+            badge_cy + badge_r,
+            fill="#ffffff",
+            outline="#ffffff",
+        )
+        canvas.create_text(
+            badge_cx,
+            badge_cy,
+            text=str(sticker),
+            fill="#000000",
+            font=("Segoe UI", 11, "bold"),
+        )
+
+    def _draw_bar(self, canvas, value, color, bg_color, sticker):
+        canvas.delete("all")
+        w = self.bar_width
+        h = self.bar_height
+        r = h // 2
+
+        canvas.create_rectangle(r, 0, w - r, h, fill=bg_color, outline=bg_color)
+        canvas.create_oval(0, 0, h, h, fill=bg_color, outline=bg_color)
+        canvas.create_oval(w - h, 0, w, h, fill=bg_color, outline=bg_color)
+
+        try:
+            v = int(value)
+        except Exception:
+            v = 0
+        v = max(0, min(100, v))
+
+        fill_w = int((v / 100) * w)
+        fill_w = max(0, min(w, fill_w))
+        if fill_w > 0:
+            if fill_w < h:
+                canvas.create_oval(0, 0, h, h, fill=color, outline=color)
+            else:
+                canvas.create_rectangle(r, 0, fill_w - r, h, fill=color, outline=color)
+                canvas.create_oval(0, 0, h, h, fill=color, outline=color)
+                canvas.create_oval(fill_w - h, 0, fill_w, h, fill=color, outline=color)
+
+        self._draw_badge_sticker(canvas, sticker)
+        canvas.create_text(w - 16, h // 2, text=str(v), fill="white", font=("Segoe UI", 11, "bold"))
+
+    def update_bars(self):
+        self._draw_bar(self.hunger, getattr(self.pet, "hunger", 0), "#e74c3c", "#3d1a1a", "🍖")
+        self._draw_bar(self.energy, getattr(self.pet, "energy", 0), "#3498db", "#1a2a3d", "⚡")
+        self._draw_bar(self.mood, getattr(self.pet, "mood", 0), "#2ecc71", "#1a3d1a", "😊")
+
+
+class PetWindow:
+    def __init__(self):
+        self.pet = Pet()
+
+        self.root = tk.Tk()
+        self.root.title("Desktop Pet")
+        self.root.overrideredirect(True)
+        self.root.attributes("-topmost", True)
+        try:
+            self.root.attributes("-transparentcolor", "white")
+        except Exception:
+            pass
+        self.root.configure(bg="white")
+        self.root.geometry("260x260+200+200")
+        self.root.protocol("WM_DELETE_WINDOW", self.quit)
+
+        self.biteoverlay = None
+        self.popup = None
+
+        self.weather_q = queue.Queue()
+        self.weather_state = WeatherState()
+        self.weather_reactor = WeatherReactor()
+
+        self.weather = WeatherService(
+            lat=47.2313,
+            lon=39.7233,
+            on_update=lambda st: self.weather_q.put(st),
+            interval_sec=600,
+        )
+        self.weather.start()
+
+        self.active_reaction_until_ms = 0
+        self.active_reaction_priority = -1
+        self.root.after(250, self._weather_tick)
+
+        self.offsetx = 0
+        self.offsety = 0
+        self.ismoving = False
+
+        self.state = MoveState.WALK
+        self.vx = 0.35
+        self.vy = 0.0
+        self.gravity = 0.35
+        self.max_fall_speed = 10.0
+        self.walk_dir = 1
+        self.action_lock_ms = 0
+
+        self.platform_refresh_ms = 250
+        self.next_platform_refresh_ms = 0
+        self.platforms_engine = WindowsPlatforms(self.get_work_area, self._exclude_hwnds)
+        self.platforms_engine.refresh()
+
+        self._outer_pad_y = 10
+        self._outer_pad_x = 10
+
+        self.petframe = tk.Frame(self.root, bg="white")
+        self.petframe.pack(expand=True, fill="both", padx=self._outer_pad_x, pady=self._outer_pad_y)
+
+        self.petcontainer = tk.Frame(self.petframe, bg="white", width=170, height=170)
+        self.petcontainer.pack(expand=True)
+        self.petcontainer.pack_propagate(False)
+
+        self.petlabel = tk.Label(self.petcontainer, bg="white")
+        self.petlabel.place(relx=0.5, rely=0.5, anchor="center")
+
+        self.menubutton = tk.Button(
+            self.petcontainer,
+            text="≡",
+            font=("Segoe UI", 12, "bold"),
+            bg="#0f0f0f",
+            fg="white",
+            bd=1,
+            relief="solid",
+            highlightthickness=0,
+            activebackground="#2b2b2b",
+            activeforeground="white",
+            command=self.togglepopup,
+            padx=5,
+            pady=0,
+        )
+        self.menubutton.place(relx=1.0, rely=0.0, anchor="ne", x=-2, y=2)
+        ToolTip(self.menubutton, "Меню")
+
+        self.animator = GifAnimator(self.petlabel)
+        self._safe_loadanimation("idle")
+
+        self.root.bind("<Button-1>", self.startdrag, add="+")
+        self.root.bind("<B1-Motion>", self.drag, add="+")
+        self.root.bind("<ButtonRelease-1>", self.stopdrag, add="+")
+        self.root.bind("<Button-3>", self.showcontextmenu, add="+")
+
+        self.contextmenu = Menu(self.root, tearoff=0)
+        self.contextmenu.add_command(label="Покормить", command=self.feed)
+        self.contextmenu.add_command(label="Поиграть", command=self.playaction)
+        self.contextmenu.add_command(label="Спать", command=self.sleeppet)
+        self.contextmenu.add_separator()
+        self.contextmenu.add_checkbutton(label="Режим укусов", command=self.togglebitemode)
+        self.contextmenu.add_command(label="Сбросить укусы", command=self.resetbites)
+        self.contextmenu.add_separator()
+        self.contextmenu.add_command(label="Выход", command=self.quit)
+
+        self.tray_icon = None
+        self._init_tray_safe()
+
+        self.hud = HUDFollower(self.root, self.pet)
+        self._hud_offset_y = 62
+        self._hud_offset_x = 0
+        self.follow_hud()
+
+        if getattr(self.pet, "bite_mode", False) or getattr(self.pet, "bitemode", False):
+            self.initbiteoverlay()
+
+        self.updatepet()
+        self.animateloop()
+        self.motion_loop()
+
+    def _now_ms(self):
+        return int(time.monotonic() * 1000)
+
+    def get_work_area(self):
+        monitor_info = GetMonitorInfo(MonitorFromPoint((0, 0)))
+        return monitor_info.get("Work")
+
+    def _exclude_hwnds(self):
+        ids = []
+        try:
+            ids.append(self.root.winfo_id())
+        except Exception:
+            pass
+        try:
+            ids.append(self.hud.winfo_id())
+        except Exception:
+            pass
+        try:
+            if self.popup and self.popup.winfo_exists():
+                ids.append(self.popup.winfo_id())
+        except Exception:
+            pass
+        return ids
+
+    def _safe_loadanimation(self, name: str):
+        try:
+            ok = self.animator.load_gif(name) if hasattr(self.animator, "load_gif") else self.animator.loadgif(name)
+            return bool(ok)
+        except Exception:
+            return False
+
+    def _apply_reaction(self, reaction):
+        if reaction is None:
+            return
+        now = self._now_ms()
+        if now < self.active_reaction_until_ms and reaction.priority < self.active_reaction_priority:
+            return
+
+        self.active_reaction_priority = reaction.priority
+        self.active_reaction_until_ms = now + int(reaction.ttl_ms)
+
+        if reaction.anim:
+            if self._safe_loadanimation(reaction.anim):
+                self.root.after(reaction.ttl_ms, lambda: self._safe_loadanimation("idle"))
+
+    def _weather_tick(self):
+        try:
+            while True:
+                st = self.weather_q.get_nowait()
+                self.weather_state = st
+        except Exception:
+            pass
+
+        try:
+            if self.action_lock_ms == 0 and self.state != MoveState.DRAG:
+                r = self.weather_reactor.reaction_for(self.weather_state)
+                self._apply_reaction(r)
+        except Exception:
+            pass
+
+        self.root.after(500, self._weather_tick)
+
+    def follow_hud(self):
+        try:
+            if not self.hud.winfo_exists():
+                return
+        except Exception:
+            return
+
+        x = self.root.winfo_x()
+        y = self.root.winfo_y()
+
+        self.root.update_idletasks()
+        pet_w = self.root.winfo_width()
+        hud_w = self.hud.bar_width
+
+        hx = x + (pet_w // 2) - (hud_w // 2) + self._hud_offset_x
+        hy = y - self._hud_offset_y
+
+        self.hud.geometry(f"+{hx}+{hy}")
+        self.hud.update_bars()
+        self.root.after(33, self.follow_hud)
+
+    def animateloop(self):
+        try:
+            interval = self.animator.animate()
+            self.root.after(int(interval), self.animateloop)
+        except Exception:
+            self.root.after(80, self.animateloop)
+
+    def motion_loop(self):
+        self.step_motion()
+        self.root.after(33, self.motion_loop)
+
+    def _effective_body_height(self):
+        try:
+            self.root.update_idletasks()
+            cont_h = self.petcontainer.winfo_height()
+            return int(self._outer_pad_y + cont_h)
+        except Exception:
+            return int(self.root.winfo_height())
+
+    def step_motion(self):
+        if self.state == MoveState.DRAG:
+            return
+
+        now_ms = self._now_ms()
+
+        if now_ms >= self.next_platform_refresh_ms:
+            self.next_platform_refresh_ms = now_ms + self.platform_refresh_ms
+            try:
+                self.platforms_engine.refresh()
+            except Exception:
+                pass
+
+        if self.action_lock_ms > 0:
+            self.action_lock_ms = max(0, self.action_lock_ms - 33)
+
+        self.root.update_idletasks()
+        x = self.root.winfo_x()
+        y = self.root.winfo_y()
+        w = self.root.winfo_width()
+        h = self.root.winfo_height()
+
+        body_h = self._effective_body_height()
+        pet_left = x
+        pet_right = x + w
+        pet_body_bottom = y + body_h
+
+        plat = None
+        try:
+            plat = self.platforms_engine.find_under(pet_left, pet_right, pet_body_bottom - 1, min_overlap=60)
+        except Exception:
+            plat = None
+
+        if plat:
+            plat_l, plat_y, plat_r = plat
+            floor_y = plat_y - body_h
+            min_x = plat_l
+            max_x = plat_r - w
+        else:
+            wa_l, wa_t, wa_r, wa_b = self.get_work_area()
+            floor_y = wa_b - body_h
+            min_x = wa_l
+            max_x = wa_r - w
+
+        wa_l, wa_t, wa_r, wa_b = self.get_work_area()
+
+        min_x = max(min_x, wa_l)
+        max_x = min(max_x, wa_r - w)
+        if min_x > max_x:
+            min_x = wa_l
+            max_x = wa_r - w
+
+        max_window_y = wa_b - h
+        if floor_y > max_window_y:
+            floor_y = max_window_y
+
+        on_floor = (y >= floor_y - 1) and (y <= floor_y + 2)
+        if not on_floor:
+            self.state = MoveState.FALL
+
+        if self.state == MoveState.FALL:
+            self.vy = min(self.max_fall_speed, self.vy + self.gravity)
+            y = y + int(self.vy)
+            if y >= floor_y:
+                y = floor_y
+                self.vy = 0.0
+                self.state = MoveState.WALK
+
+        elif self.state == MoveState.WALK:
+            x = x + int(self.walk_dir * self.vx * 10)
+            if x <= min_x:
+                x = min_x
+                self.walk_dir = 1
+            elif x >= max_x:
+                x = max_x
+                self.walk_dir = -1
+            y = floor_y
+            self.vy = 0.0
+
+        if x < wa_l:
+            x = wa_l
+        if x > wa_r - w:
+            x = wa_r - w
+        if y < wa_t:
+            y = wa_t
+        if y > wa_b - h:
+            y = wa_b - h
+
+        self.root.geometry(f"+{x}+{y}")
+
+    def startdrag(self, event):
+        self.offsetx = event.x
+        self.offsety = event.y
+        self.ismoving = True
+        self.state = MoveState.DRAG
+        self.vy = 0.0
+
+    def drag(self, event):
+        if self.ismoving:
+            x = self.root.winfo_x() + event.x - self.offsetx
+            y = self.root.winfo_y() + event.y - self.offsety
+            self.root.geometry(f"+{x}+{y}")
+
+    def stopdrag(self, event):
+        self.ismoving = False
+        self.state = MoveState.WALK
+        self.vy = 0.0
+
+    def showcontextmenu(self, event):
+        self.contextmenu.post(event.x_root, event.y_root)
+
+    def feed(self):
+        try:
+            self.pet.feed()
+        except Exception:
+            pass
+        self.action_lock_ms = 2000
+        if not self.ismoving:
+            self._safe_loadanimation("eating")
+            self.root.after(2000, lambda: self._safe_loadanimation("idle"))
+
+    def playaction(self):
+        if self.ismoving:
+            return
+        try:
+            self.pet.play()
+        except Exception:
+            pass
+        self.action_lock_ms = 2000
+        self._safe_loadanimation("playing")
+        self.root.after(2000, lambda: self._safe_loadanimation("idle"))
+
+    def sleeppet(self):
+        if self.ismoving:
+            return
+        try:
+            self.pet.sleep()
+        except Exception:
+            pass
+        self.action_lock_ms = 3000
+        self._safe_loadanimation("sleeping")
+        self.root.after(3000, lambda: self._safe_loadanimation("idle"))
+
+    def togglepopup(self):
+        try:
+            if self.popup and self.popup.winfo_exists():
+                self.popup.destroy()
+                self.popup = None
+                return
+        except Exception:
+            self.popup = None
+
+        callbacks = {
+            "feed": self.feed,
+            "play": self.playaction,
+            "sleep": self.sleeppet,
+            "togglebite": self.togglebitemode,
+            "resetbites": self.resetbites,
+            "quit": self.quit,
+        }
+        self.popup = ActionsPopup(self.root, callbacks)
+
+        try:
+            self.root.update_idletasks()
+            self.popup.update_idletasks()
+            rootx = self.root.winfo_rootx()
+            rooty = self.root.winfo_rooty()
+            rootw = self.root.winfo_width()
+            popw = self.popup.winfo_width()
+            poph = self.popup.winfo_height()
+
+            x = rootx + rootw - popw - 2
+            y = rooty - poph - 8
+            if y < 0:
+                y = rooty + 8
+            self.popup.geometry(f"+{x}+{y}")
+        except Exception:
+            pass
+
+    def _tray_quit(self, icon=None, item=None):
+        try:
+            self.root.after(0, self.quit)
+        except Exception:
+            pass
+
+    def _find_tray_icon_path(self):
+        base = os.path.dirname(os.path.abspath(__file__))
+        candidates = [
+            os.path.join(base, "assets", "tray.ico"),
+            os.path.join(base, "assets", "icon.ico"),
+            os.path.join(base, "assets", "tray.png"),
+            os.path.join(base, "assets", "icon.png"),
+        ]
+        for p in candidates:
+            if os.path.exists(p):
+                return p
+        return None
+
+    def _tray_toggle_actions(self, icon=None, item=None):
+        try:
+            self.root.after(0, self.togglepopup)
+        except Exception:
+            pass
+
+    def _init_tray_safe(self):
+        try:
+            icon_path = self._find_tray_icon_path()
+            if not icon_path:
+                return
+            image = Image.open(icon_path)
+
+            menu = TrayMenu(
+                TrayItem("Взаимодействие", self._tray_toggle_actions, default=True),
+                TrayItem("Выход", self._tray_quit),
+            )
+            self.tray_icon = pystray.Icon("desktop-pet", image, "Desktop Pet", menu)
+            threading.Thread(target=self.tray_icon.run, daemon=True).start()
+        except Exception:
+            self.tray_icon = None
+
+    def togglebitemode(self):
+        if hasattr(self.pet, "bite_mode"):
+            self.pet.bite_mode = not self.pet.bite_mode
+            if hasattr(self.pet, "save_state"):
+                self.pet.save_state()
+        elif hasattr(self.pet, "bitemode"):
+            self.pet.bitemode = not self.pet.bitemode
+            if hasattr(self.pet, "savestate"):
+                self.pet.savestate()
+
+        if getattr(self.pet, "bite_mode", False) or getattr(self.pet, "bitemode", False):
+            self.initbiteoverlay()
+        else:
+            if self.biteoverlay:
+                try:
+                    self.biteoverlay.destroy()
+                except Exception:
+                    pass
+                self.biteoverlay = None
+
+    def initbiteoverlay(self):
+        if BiteOverlay is None:
+            return
+        if self.biteoverlay is None:
+            self.biteoverlay = BiteOverlay()
+
+    def resetbites(self):
+        if hasattr(self.pet, "reset_bites"):
+            try:
+                self.pet.reset_bites()
+            except Exception:
+                pass
+        elif hasattr(self.pet, "resetbites"):
+            try:
+                self.pet.resetbites()
+            except Exception:
+                pass
+
+    def updatepet(self):
+        try:
+            self.pet.tick()
+        except Exception:
+            pass
+        self.root.after(10000, self.updatepet)
+
+    def quit(self):
+        try:
+            self.weather.stop()
+        except Exception:
+            pass
+
+        try:
+            if hasattr(self.pet, "save_state"):
+                self.pet.save_state()
+            elif hasattr(self.pet, "savestate"):
+                self.pet.savestate()
+        except Exception:
+            pass
+
+        try:
+            if self.tray_icon:
+                self.tray_icon.stop()
+        except Exception:
+            pass
+
+        try:
+            if hasattr(self, "hud") and self.hud and self.hud.winfo_exists():
+                self.hud.destroy()
+        except Exception:
+            pass
+
+        try:
+            if self.biteoverlay:
+                self.biteoverlay.destroy()
+        except Exception:
+            pass
+
+        try:
+            if self.popup and self.popup.winfo_exists():
+                self.popup.destroy()
+        except Exception:
+            pass
+
+        try:
+            self.root.destroy()
+        except Exception:
+            pass
+
+
+if __name__ == "__main__":
+    w = PetWindow()
+    w.root.mainloop()
